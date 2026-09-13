@@ -32,6 +32,8 @@ actions!(
         RefreshFolders,
         ClearSearch,
         Preferences,
+        About,
+        CheckUpdates,
         Exit
     ]
 );
@@ -430,6 +432,39 @@ impl Shell {
         window.remove_window();
     }
 
+    fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog
+                .title("About Codex Air")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Codex Air"))
+                        .child(theme::caption(format!(
+                            "Version {}",
+                            env!("CARGO_PKG_VERSION")
+                        )))
+                        .child(theme::caption("A native Windows workspace for Codex.")),
+                )
+                .footer(dialog_footer("Close", false))
+        });
+    }
+
+    fn check_updates(&mut self, _: &CheckUpdates, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog
+                .title("Check for updates")
+                .child("Codex Air is up to date.")
+                .child(theme::caption(format!(
+                    "Version {}",
+                    env!("CARGO_PKG_VERSION")
+                )))
+                .footer(dialog_footer("Close", false))
+        });
+    }
+
     fn app_header(&self, _: &Context<Self>) -> AnyElement {
         let workspace = self
             .state
@@ -444,22 +479,26 @@ impl Shell {
                     .h_full()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .flex_1()
                     .child(
-                        div()
+                        Button::new("app-menu")
+                            .ghost()
+                            .small()
+                            .w(px(34.))
+                            .h_full()
+                            .text_color(rgb(ACCENT))
                             .text_color(rgb(ACCENT))
                             .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.))
-                            .child("///"),
+                            .label("///")
+                            .accessibility_label("Codex Air menu")
+                            .tooltip("Codex Air")
+                            .dropdown_menu(|menu, _, _| {
+                                menu.menu("About Codex Air", Box::new(About))
+                                    .separator()
+                                    .menu("Check for updates…", Box::new(CheckUpdates))
+                            }),
                     )
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(13.))
-                            .child("Codex Air"),
-                    )
-                    .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
                     .child(self.menubar())
                     .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
                     .child(
@@ -509,53 +548,14 @@ impl Shell {
                     }),
             )
             .child(
-                Button::new("menu-selection")
+                Button::new("menu-help")
                     .ghost()
                     .small()
-                    .label("Selection")
+                    .label("Help")
                     .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("Select all").disabled(true))
-                            .item(PopupMenuItem::new("Expand selection").disabled(true))
-                    }),
-            )
-            .child(
-                Button::new("menu-view")
-                    .ghost()
-                    .small()
-                    .label("View")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("Appearance").disabled(true))
-                            .item(PopupMenuItem::new("Command palette").disabled(true))
-                    }),
-            )
-            .child(
-                Button::new("menu-go")
-                    .ghost()
-                    .small()
-                    .label("Go")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("Back").disabled(true))
-                            .item(PopupMenuItem::new("Forward").disabled(true))
-                    }),
-            )
-            .child(
-                Button::new("menu-run")
-                    .ghost()
-                    .small()
-                    .label("Run")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("Start task").disabled(true))
-                            .item(PopupMenuItem::new("Stop task").disabled(true))
-                    }),
-            )
-            .child(
-                Button::new("menu-terminal")
-                    .ghost()
-                    .small()
-                    .label("Terminal")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("New terminal").disabled(true))
-                            .item(PopupMenuItem::new("Split terminal").disabled(true))
+                        menu.menu("Check for updates…", Box::new(CheckUpdates))
+                            .separator()
+                            .menu("About Codex Air", Box::new(About))
                     }),
             )
             .into_any_element()
@@ -1201,6 +1201,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::clear_search))
             .on_action(cx.listener(Self::preferences))
+            .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::check_updates))
             .on_action(cx.listener(Self::exit))
             .relative()
             .size_full()
