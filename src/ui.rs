@@ -458,18 +458,17 @@ impl Shell {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(13.))
                             .child("Codex Air"),
+                    )
+                    .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
+                    .child(self.menubar())
+                    .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(TEXT))
+                            .child(workspace),
                     ),
-            )
-            .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
-            .child(self.menubar())
-            .child(div().h(px(18.)).border_l_1().border_color(rgb(BORDER)))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_color(rgb(TEXT))
-                    .child(workspace),
             )
             .into_any_element()
     }
@@ -751,20 +750,10 @@ impl Shell {
                         .ghost()
                         .w_full()
                         .justify_start()
-                        .icon(IconName::User)
-                        .label(self.account.email.clone().unwrap_or_else(|| {
-                            if self.account.connected {
-                                "Codex connected".into()
-                            } else {
-                                "Connect Codex".into()
-                            }
-                        }))
-                        .accessibility_label("Codex account and preferences")
-                        .tooltip(if self.account.connected {
-                            "Codex connected · Preferences"
-                        } else {
-                            "Connect Codex · Preferences"
-                        })
+                        .icon(IconName::Settings)
+                        .label("Codex Settings")
+                        .accessibility_label("Codex Settings")
+                        .tooltip("Codex Settings")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.preferences(&Preferences, window, cx)
                         })),
@@ -1169,9 +1158,9 @@ impl Shell {
                             } else {
                                 "Account status will appear when the local App Server responds."
                             })),
-                    )
-                    .child(self.task_composer(cx)),
+                    ),
             )
+            .child(div().px_6().pb_3().child(self.task_composer(cx)))
             .child(
                 div()
                     .h(px(34.))

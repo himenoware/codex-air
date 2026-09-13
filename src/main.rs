@@ -31,6 +31,7 @@ fn main() {
         return;
     };
     let instance = std::rc::Rc::new(instance);
+    let saved_window = storage::load(&storage::default_state_path()).state.window;
     let window_instance = instance.clone();
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     diagnostics::mark("platform_created");
@@ -41,12 +42,20 @@ fn main() {
         theme::init(cx);
         diagnostics::mark("theme_ready");
         ui::bind_keys(cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+        let initial_bounds = match saved_window.as_ref() {
+            Some(saved) if saved.maximized => WindowBounds::Maximized(Bounds::centered(
                 None,
-                size(px(1120.), px(760.)),
+                size(px(saved.width), px(saved.height)),
                 cx,
-            ))),
+            )),
+            Some(saved) => WindowBounds::Windowed(Bounds::new(
+                point(px(saved.x), px(saved.y)),
+                size(px(saved.width), px(saved.height)),
+            )),
+            None => WindowBounds::Windowed(Bounds::centered(None, size(px(1120.), px(760.)), cx)),
+        };
+        let options = WindowOptions {
+            window_bounds: Some(initial_bounds),
             window_min_size: Some(size(px(800.), px(560.))),
             app_id: Some("CodexAir.Desktop".into()),
             ..TitleBar::window_options()
