@@ -9,9 +9,9 @@ use windows::Win32::{
     Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect},
     System::Threading::CreateMutexW,
     UI::WindowsAndMessaging::{
-        EnumWindows, GetPropW, GetWindowPlacement, MessageBoxW, SW_RESTORE, SW_SHOWMAXIMIZED,
-        SW_SHOWNORMAL, SetForegroundWindow, SetPropW, SetWindowPlacement, ShowWindow,
-        WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+        EnumWindows, GetPropW, GetWindowPlacement, IsIconic, MessageBoxW, SW_RESTORE,
+        SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SetForegroundWindow, SetPropW, SetWindowPlacement,
+        ShowWindow, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
     },
 };
 use windows::core::BOOL;
@@ -50,7 +50,12 @@ impl InstanceGuard {
             };
             if let Some(window) = existing {
                 unsafe {
-                    let _ = ShowWindow(window, SW_RESTORE);
+                    // Restoring an already maximized window would silently turn it into a
+                    // normal window. Only restore a minimized instance; Windows preserves a
+                    // maximized restore state when SW_RESTORE is applied to that case.
+                    if IsIconic(window).as_bool() {
+                        let _ = ShowWindow(window, SW_RESTORE);
+                    }
                     let _ = SetForegroundWindow(window);
                 }
             } else {
@@ -180,6 +185,17 @@ fn stable_path_key(path: &Path) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+pub fn saved_display(saved: &crate::workspace::WindowPlacement) -> Option<gpui_kit::DisplayId> {
+    let rect = RECT {
+        left: saved.x as i32,
+        top: saved.y as i32,
+        right: (saved.x + saved.width) as i32,
+        bottom: (saved.y + saved.height) as i32,
+    };
+    let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
+    (!monitor.is_invalid()).then(|| gpui_kit::DisplayId::new(monitor.0 as u64))
 }
 
 pub fn placement(window: &Window) -> Option<crate::workspace::WindowPlacement> {

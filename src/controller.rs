@@ -22,6 +22,7 @@ pub enum Command {
     Refresh,
     Placement(WindowPlacement),
     Sidebar(f32),
+    Preferences(crate::workspace::Preferences),
     Close,
 }
 
@@ -104,6 +105,7 @@ pub fn start() -> (mpsc::Sender<Command>, async_channel::Receiver<Snapshot>) {
                     Command::ToggleArchive(id) => { state.toggle_archive_workspace(id); }
                     Command::SetThread(id, thread_id) => { state.set_thread_id(id, thread_id); }
                     Command::Refresh => {}
+                    Command::Preferences(preferences) => { state.preferences = preferences; }
                     _ => unreachable!(),
                 }
                 Ok(())

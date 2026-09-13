@@ -1,24 +1,32 @@
 use crate::{
     app_server::{self, AccountStatus},
+    codex_settings::{CodexSettings, SettingsChanged},
+    composer_controls::{ComposerControls, StatusView},
     controller::{self, Command},
     platform,
+    preferences::PreferencesView,
+    questions::QuestionView,
     theme::{self, *},
     workspace::{AppState, WorkspaceRoot},
 };
 use gpui_kit::{
     assets::IconName,
-    base::{Disableable, h_resizable, resizable_panel},
+    base::{Disableable, h_resizable, resizable_panel, text::TextView},
     component::{
         Icon, Root, Sizable, TitleBar, WindowExt,
         button::{Button, ButtonVariants},
         dialog::Confirm,
-        input::{Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+        scroll::ScrollableElement,
     },
     prelude::FluentBuilder,
     *,
 };
-use std::{collections::HashMap, sync::mpsc::Sender};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::mpsc::Sender,
+};
 use uuid::Uuid;
 
 actions!(
@@ -32,6 +40,7 @@ actions!(
         RefreshFolders,
         ClearSearch,
         Preferences,
+        OpenCodexSettings,
         About,
         CheckUpdates,
         ReleaseNotes,
@@ -40,12 +49,35 @@ actions!(
     ]
 );
 
+#[derive(Clone)]
+struct ActivityEntry {
+    workspace: Uuid,
+    id: Option<String>,
+    kind: String,
+    text: String,
+    user: bool,
+}
+
+fn activity_label(kind: &str) -> &str {
+    match kind {
+        "commandExecution" => "Ran command",
+        "fileChange" => "Edited files",
+        "mcpToolCall" | "dynamicToolCall" => "Used tool",
+        "webSearch" => "Searched the web",
+        "collabAgentToolCall" => "Agent activity",
+        "reasoning" => "Thinking",
+        "status" => "Codex",
+        _ => "Activity",
+    }
+}
+
 pub struct Shell {
     state: AppState,
     availability: HashMap<Uuid, bool>,
     sender: Sender<Command>,
     search: Entity<InputState>,
-    composer: Entity<InputState>,
+    composer: Entity<TextareaState>,
+    composer_controls: Entity<ComposerControls>,
     focus: FocusHandle,
     loaded: bool,
     warning: Option<String>,
@@ -55,9 +87,18 @@ pub struct Shell {
     availability_generation: u64,
     account: AccountStatus,
     account_sender: Sender<app_server::Request>,
-    thread_id: Option<String>,
     turn_active: bool,
-    activity: Vec<String>,
+    active_turn_workspace: Option<Uuid>,
+    loaded_threads: HashSet<(Uuid, String)>,
+    token_usage: HashMap<Uuid, (String, i64, Option<i64>)>,
+    attachments: Vec<std::path::PathBuf>,
+    drafts: HashMap<Uuid, (String, Vec<std::path::PathBuf>)>,
+    conversation_scroll: ScrollHandle,
+    activity: Vec<ActivityEntry>,
+    pending_approvals: Vec<app_server::Approval>,
+    pending_questions: HashMap<Uuid, Entity<QuestionView>>,
+    expanded_activity: HashSet<(Uuid, String)>,
+    folders_collapsed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -65,9 +106,14 @@ impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (sender, updates) = controller::start();
         let (account_sender, account_updates) = app_server::start();
+        let composer_controls =
+            cx.new(|cx| ComposerControls::new(account_sender.clone(), None, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find a workspace…"));
         let composer = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Ask Codex to work on this workspace…")
+            TextareaState::new(window, cx)
+                .placeholder("Ask Codex to work on this workspace…")
+                .auto_grow(2, 8)
+                .submit_on_enter(true)
         });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -97,7 +143,10 @@ impl Shell {
         });
         let composer_subscription =
             cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+                if let InputEvent::PressEnter { secondary, shift } = event
+                    && !shift
+                    && (this.state.preferences.enter_sends || *secondary)
+                {
                     this.start_task(window, cx);
                 }
             });
@@ -125,10 +174,56 @@ impl Shell {
                         }
                         if snapshot.initial
                             && let Some(saved) = &snapshot.state.window
+                            && !saved.maximized
                         {
                             platform::restore(window, saved);
                         }
+                        if this.state.active_workspace != snapshot.state.active_workspace {
+                            if let Some(previous) = this.state.active_workspace {
+                                this.drafts.insert(
+                                    previous,
+                                    (
+                                        this.composer.read(cx).value().to_string(),
+                                        std::mem::take(&mut this.attachments),
+                                    ),
+                                );
+                            }
+                            let (text, attachments) = snapshot
+                                .state
+                                .active_workspace
+                                .and_then(|id| this.drafts.remove(&id))
+                                .unwrap_or_default();
+                            this.attachments = attachments;
+                            this.composer
+                                .update(cx, |input, cx| input.set_value(text, window, cx));
+                            this.conversation_scroll.scroll_to_bottom();
+                        }
                         this.state = snapshot.state;
+                        if let Some(workspace) = this.state.active()
+                            && let Some(thread_id) = &workspace.thread_id
+                            && this
+                                .loaded_threads
+                                .insert((workspace.id, thread_id.clone()))
+                        {
+                            let _ = this.account_sender.send(app_server::Request::ReadThread {
+                                workspace: workspace.id,
+                                thread_id: thread_id.clone(),
+                            });
+                        }
+                        let cwd = this.state.active().and_then(|workspace| {
+                            workspace
+                                .default_root
+                                .and_then(|id| workspace.roots.iter().find(|root| root.id == id))
+                                .or_else(|| workspace.roots.first())
+                                .map(|root| root.path.clone())
+                        });
+                        this.composer_controls.update(cx, |controls, cx| {
+                            controls.set_workspace(cwd, cx);
+                        });
+                        let enter_sends = this.state.preferences.enter_sends;
+                        this.composer.update(cx, |input, cx| {
+                            input.set_submit_on_enter(enter_sends, cx);
+                        });
                         this.check_folders(window, cx);
                         this.warning = snapshot.warning;
                         this.loaded = true;
@@ -154,7 +249,7 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(update) = account_updates.recv().await {
                 if this
-                    .update_in(cx, |this, _, cx| {
+                    .update_in(cx, |this, window, cx| {
                         match update {
                             app_server::Update::Status(status) => this.account = status,
                             app_server::Update::LoginUrl(url) => cx.open_url(&url),
@@ -162,16 +257,65 @@ impl Shell {
                                 workspace,
                                 thread_id,
                             } => {
-                                this.thread_id = Some(thread_id.clone());
+                                this.loaded_threads.insert((workspace, thread_id.clone()));
                                 this.send(Command::SetThread(workspace, thread_id));
                             }
-                            app_server::Update::Activity(activity) => {
-                                this.activity.push(activity);
-                                if this.activity.len() > 80 {
-                                    self::Shell::trim_activity(&mut this.activity);
+                            app_server::Update::ThreadLoaded {
+                                workspace,
+                                thread_id,
+                            } => {
+                                this.loaded_threads.insert((workspace, thread_id));
+                            }
+                            app_server::Update::TokenUsage {
+                                workspace,
+                                thread_id,
+                                used,
+                                context_window,
+                            } => {
+                                this.token_usage
+                                    .insert(workspace, (thread_id, used, context_window));
+                            }
+                            app_server::Update::Item {
+                                workspace,
+                                id,
+                                kind,
+                                text,
+                            } => {
+                                let follow = this.conversation_scroll.offset().y.abs()
+                                    >= this.conversation_scroll.max_offset().y - px(80.);
+                                this.upsert_item_activity(workspace, id, kind, text);
+                                if follow && this.state.active_workspace == Some(workspace) {
+                                    this.conversation_scroll.scroll_to_bottom();
                                 }
                             }
-                            app_server::Update::TurnFinished => this.turn_active = false,
+                            app_server::Update::ApprovalRequested(approval) => {
+                                this.pending_approvals.push(approval);
+                            }
+                            app_server::Update::QuestionsRequested {
+                                workspace,
+                                id,
+                                questions,
+                            } => {
+                                let sender = this.account_sender.clone();
+                                let view = cx
+                                    .new(|cx| QuestionView::new(id, questions, sender, window, cx));
+                                this.pending_questions.insert(workspace, view);
+                            }
+                            app_server::Update::TurnFinished { workspace, error } => {
+                                this.turn_active = false;
+                                this.active_turn_workspace = None;
+                                this.pending_questions.remove(&workspace);
+                                this.pending_approvals
+                                    .retain(|approval| approval.workspace != workspace);
+                                if let Some(error) = error {
+                                    this.warning = Some(error);
+                                }
+                            }
+                            app_server::Update::WorkspaceError { workspace, message } => {
+                                if this.state.active_workspace == Some(workspace) {
+                                    this.warning = Some(message);
+                                }
+                            }
                             app_server::Update::Error(error) => {
                                 this.turn_active = false;
                                 this.warning = Some(error);
@@ -199,6 +343,7 @@ impl Shell {
             sender,
             search,
             composer,
+            composer_controls,
             focus,
             loaded: false,
             warning: None,
@@ -208,9 +353,18 @@ impl Shell {
             availability_generation: 0,
             account: AccountStatus::default(),
             account_sender,
-            thread_id: None,
             turn_active: false,
+            active_turn_workspace: None,
+            loaded_threads: HashSet::new(),
+            token_usage: HashMap::new(),
+            attachments: Vec::new(),
+            drafts: HashMap::new(),
+            conversation_scroll: ScrollHandle::new(),
             activity: Vec::new(),
+            pending_approvals: Vec::new(),
+            pending_questions: HashMap::new(),
+            expanded_activity: HashSet::new(),
+            folders_collapsed: true,
             _subscriptions: vec![
                 input_subscription,
                 composer_subscription,
@@ -223,15 +377,81 @@ impl Shell {
         let _ = self.sender.send(command);
     }
 
-    fn trim_activity(activity: &mut Vec<String>) {
-        let excess = activity.len().saturating_sub(80);
-        if excess > 0 {
-            activity.drain(0..excess);
+    fn append_user_activity(&mut self, workspace: Uuid, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.activity.push(ActivityEntry {
+            workspace,
+            id: None,
+            kind: "user".into(),
+            text,
+            user: true,
+        });
+    }
+
+    fn upsert_item_activity(&mut self, workspace: Uuid, id: String, kind: String, text: String) {
+        let is_user = kind == "userMessage";
+        if is_user
+            && let Some(entry) = self.activity.iter_mut().rev().find(|entry| {
+                entry.workspace == workspace
+                    && entry.user
+                    && entry.id.is_none()
+                    && (entry.text == text
+                        || text
+                            .strip_prefix(&entry.text)
+                            .is_some_and(|rest| rest.starts_with("\n\nAttached local file")))
+            })
+        {
+            entry.id = Some(id);
+            return;
+        }
+        if let Some(entry) = self
+            .activity
+            .iter_mut()
+            .find(|entry| entry.workspace == workspace && entry.id.as_deref() == Some(id.as_str()))
+        {
+            entry.kind = kind;
+            entry.text = text;
+        } else {
+            self.activity.push(ActivityEntry {
+                workspace,
+                id: Some(id),
+                kind,
+                text,
+                user: is_user,
+            });
         }
     }
 
+    fn toggle_activity(&mut self, workspace: Uuid, id: String, cx: &mut Context<Self>) {
+        let key = (workspace, id);
+        if !self.expanded_activity.remove(&key) {
+            self.expanded_activity.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn resolve_approval(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .pending_approvals
+            .iter()
+            .position(|approval| Some(approval.workspace) == self.state.active_workspace)
+        else {
+            return;
+        };
+        let approval = self.pending_approvals.remove(index);
+        let _ = self
+            .account_sender
+            .send(app_server::Request::ResolveApproval {
+                id: approval.id,
+                accept,
+            });
+        cx.notify();
+    }
+
     fn start_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.turn_active {
+        if self.turn_active || !self.account.connected {
             return;
         }
         let Some((workspace_id, cwd, thread_id)) = self.state.active().and_then(|workspace| {
@@ -245,21 +465,78 @@ impl Shell {
             cx.notify();
             return;
         };
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        let mut text = self.composer.read(cx).value().trim().to_owned();
+        if text.is_empty() && self.attachments.is_empty() {
             return;
+        }
+        if text.is_empty() {
+            text = "Please inspect the attached context.".into();
         }
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.turn_active = true;
-        self.activity.push(format!("You: {text}"));
+        self.active_turn_workspace = Some(workspace_id);
+        self.warning = None;
+        self.append_user_activity(workspace_id, text.clone());
+        self.conversation_scroll.scroll_to_bottom();
+        let (model, effort) = self.composer_controls.read(cx).selection();
         let _ = self.account_sender.send(app_server::Request::StartTurn {
             workspace: workspace_id,
             cwd,
             text,
             thread_id,
+            model,
+            effort,
+            attachments: std::mem::take(&mut self.attachments),
         });
         cx.notify();
+    }
+
+    fn attach_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach context".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match prompt.await {
+            Ok(Ok(Some(paths))) => {
+                let _ = this.update(cx, |this, cx| {
+                    for path in paths {
+                        if !this.attachments.contains(&path) {
+                            this.attachments.push(path);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            Ok(Ok(None)) => {}
+            error => {
+                let _ = this.update(cx, |this, cx| {
+                    this.warning = Some(format!("Could not open the file picker: {error:?}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn session_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.state.active().and_then(|w| w.thread_id.clone());
+        let usage = self
+            .state
+            .active_workspace
+            .and_then(|id| self.token_usage.get(&id))
+            .map(|(_, used, limit)| (*used, *limit));
+        let sender = self.account_sender.clone();
+        let status = cx.new(|cx| StatusView::new(sender, thread, usage, cx));
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Session status")
+                .w(px(520.))
+                .child(status.clone())
+                .footer(dialog_footer("Close", false))
+        });
     }
 
     fn check_folders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -365,97 +642,69 @@ impl Shell {
     }
 
     fn preferences(&mut self, _: &Preferences, window: &mut Window, cx: &mut Context<Self>) {
-        let account = self.account.clone();
-        let sender = self.account_sender.clone();
+        let settings =
+            cx.new(|_| PreferencesView::new(self.state.preferences.clone(), self.sender.clone()));
         window.focus(&self.focus, cx);
         window.open_dialog(cx, move |dialog, _, _| {
-            let sender = sender.clone();
-            let connected = account.connected;
-            let identity = account.email.clone().unwrap_or_else(|| {
-                if connected {
-                    "Connected through the local Codex App Server.".into()
-                } else {
-                    "No ChatGPT account is connected to the local Codex App Server.".into()
-                }
-            });
             dialog
-                .title("Codex Settings")
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .child(div().font_weight(FontWeight::MEDIUM).child("General"))
-                        .child(div().flex().flex_col().gap_1()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Agent environment"))
-                            .child(theme::caption("Windows native"))
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Language"))
-                            .child(theme::caption("Auto detect"))
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Review delivery"))
-                            .child(theme::caption("Inline"))
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Composer"))
-                            .child(theme::caption("Enter sends a prompt · Follow-ups queue while Codex works")))
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Configuration"))
-                        .child(div().flex().flex_col().gap_1()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("config.toml"))
-                            .child(theme::caption("Codex reads your local configuration and workspace instructions when it starts a task."))
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Reasoning effort"))
-                            .child(theme::caption("Configured by the model selected by your local Codex harness.")))
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Personalization"))
-                        .child(theme::caption("Repository instructions and local Codex preferences apply to every task in this workspace."))
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Usage & billing"))
-                        .when_some(account.plan.clone(), |view, plan| {
-                            view.child(theme::caption(format!("ChatGPT {plan}")))
-                        })
-                        .child(div().font_weight(FontWeight::MEDIUM).child("MCP servers · Hooks · Plugins"))
-                        .child(theme::caption("Managed by your local Codex installation."))
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Account"))
-                        .child(
-                            div()
-                                .text_color(rgb(if connected { ACCENT } else { MUTED }))
-                                .child(identity),
-                        )
-                        .when_some(account.plan.clone(), |view, plan| {
-                            view.child(theme::caption(format!("ChatGPT {plan}")))
-                        })
-                        .when_some(account.detail.clone(), |view, detail| {
-                            view.child(theme::caption(detail))
-                        }),
-                )
-                .footer(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("close-preferences")
-                                .label("Close")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("account-preferences-action")
-                                .primary()
-                                .label(if connected {
-                                    "Refresh"
-                                } else {
-                                    "Sign in with ChatGPT"
-                                })
-                                .on_click(move |_, _, _| {
-                                    let _ = sender.send(if connected {
-                                        app_server::Request::Refresh
-                                    } else {
-                                        app_server::Request::StartChatGptLogin
-                                    });
-                                }),
-                        ),
-                )
+                .title("Preferences")
+                .w(px(560.))
+                .child(settings.clone())
+                .footer(dialog_footer("Close", false))
         });
     }
 
-    fn exit(&mut self, _: &Exit, window: &mut Window, _: &mut Context<Self>) {
-        // Keep the action local to the current native window. The regular
-        // close path remains responsible for placement/state persistence.
-        window.remove_window();
+    fn codex_settings(
+        &mut self,
+        _: &OpenCodexSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self
+            .state
+            .active()
+            .and_then(|workspace| {
+                workspace
+                    .default_root
+                    .and_then(|id| workspace.roots.iter().find(|root| root.id == id))
+                    .or_else(|| workspace.roots.first())
+            })
+            .map(|root| root.path.clone());
+        let settings = cx.new(|cx| {
+            CodexSettings::new(
+                self.account_sender.clone(),
+                cwd,
+                self.account.clone(),
+                window,
+                cx,
+            )
+        });
+        self._subscriptions.push(cx.subscribe_in(
+            &settings,
+            window,
+            |this, _, _: &SettingsChanged, _, cx| {
+                this.composer_controls
+                    .update(cx, |controls, cx| controls.refresh(cx));
+            },
+        ));
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Codex Settings")
+                .w(px(820.))
+                .child(settings.clone())
+                .footer(dialog_footer("Close", false))
+        });
+    }
+
+    fn exit(&mut self, _: &Exit, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.closing {
+            self.closing = true;
+            if let Some(placement) = platform::placement(window) {
+                self.send(Command::Placement(placement));
+            }
+            self.send(Command::Close);
+            cx.notify();
+        }
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
@@ -479,27 +728,60 @@ impl Shell {
     }
 
     fn check_updates(&mut self, _: &CheckUpdates, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_dialog(cx, |dialog, _, _| {
+        let status = cx.new(crate::updates::UpdateView::new);
+        window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Check for updates")
-                .child("Codex Air is up to date.")
+                .child(status.clone())
                 .child(theme::caption(format!(
                     "Version {}",
                     env!("CARGO_PKG_VERSION")
                 )))
-                .footer(dialog_footer("Close", false))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("close-updates")
+                                .label("Close")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("open-releases")
+                                .primary()
+                                .label("Open releases")
+                                .on_click(|_, _, cx| {
+                                    cx.open_url("https://github.com/himenoware/codex-air/releases");
+                                }),
+                        ),
+                )
         });
     }
 
     fn release_notes(&mut self, _: &ReleaseNotes, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, _| {
+            let mut notes = div()
+                .id("release-history")
+                .max_h(px(420.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_5();
+            for note in crate::releases::RELEASES {
+                notes = notes.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(theme::caption(format!("{} · {}", note.version, note.date)))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(note.title))
+                        .child(note.body),
+                );
+            }
             dialog
                 .title("Release notes")
-                .child(div().flex().flex_col().gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Codex Air 0.2.0"))
-                    .child(theme::caption("Native header, workspace organization, local Codex account connection, and the first App Server task composer."))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Codex Air 0.1.0"))
-                    .child(theme::caption("Initial Windows-native workspace shell.")))
+                .child(notes)
                 .footer(dialog_footer("Close", false))
         });
     }
@@ -527,8 +809,9 @@ impl Shell {
                             .w_full()
                             .justify_start()
                             .label(format!("Restore  {name}"))
-                            .on_click(move |_, _, _| {
+                            .on_click(move |_, window, cx| {
                                 let _ = sender.send(Command::ToggleArchive(id));
+                                window.close_dialog(cx);
                             }),
                     );
                 }
@@ -563,9 +846,7 @@ impl Shell {
                             .w(px(34.))
                             .h_full()
                             .text_color(rgb(ACCENT))
-                            .text_color(rgb(ACCENT))
-                            .font_weight(FontWeight::BOLD)
-                            .label("///")
+                            .icon(Icon::default().path("icons/air.svg"))
                             .accessibility_label("Codex Air menu")
                             .tooltip("Codex Air")
                             .dropdown_menu(|menu, _, _| {
@@ -645,18 +926,6 @@ impl Shell {
                             .item(PopupMenuItem::new("Cut").disabled(true))
                             .item(PopupMenuItem::new("Copy").disabled(true))
                             .item(PopupMenuItem::new("Paste").disabled(true))
-                    }),
-            )
-            .child(
-                Button::new("menu-help")
-                    .ghost()
-                    .small()
-                    .label("Help")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.menu("Check for updates…", Box::new(CheckUpdates))
-                            .menu("Release notes", Box::new(ReleaseNotes))
-                            .separator()
-                            .menu("About Codex Air", Box::new(About))
                     }),
             )
             .into_any_element()
@@ -759,6 +1028,7 @@ impl Shell {
             .state
             .workspaces
             .iter()
+            .filter(|workspace| !workspace.archived)
             .filter(|w| {
                 w.display_name().to_lowercase().contains(&query)
                     || w.roots
@@ -851,32 +1121,30 @@ impl Shell {
                 |view| {
                     view.child(
                         div().px_2().pb_1().child(
-                            Button::new("archives")
-                                .ghost()
-                                .w_full()
-                                .justify_start()
-                                .icon(IconName::Archive)
-                                .label("Archives")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.archives(&Archives, window, cx)
-                                })),
+                            theme::nav_button(
+                                "archives",
+                                "Archives",
+                                Some(Icon::new(IconName::Archive)),
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.archives(&Archives, window, cx),
+                            )),
                         ),
                     )
                 },
             )
             .child(
                 div().border_t_1().border_color(rgb(BORDER)).p_2().child(
-                    Button::new("sidebar-account")
-                        .ghost()
-                        .w_full()
-                        .justify_start()
-                        .icon(IconName::Settings)
-                        .label("Codex Settings")
-                        .accessibility_label("Codex Settings")
-                        .tooltip("Codex Settings")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.preferences(&Preferences, window, cx)
-                        })),
+                    theme::nav_button(
+                        "sidebar-account",
+                        "Codex Settings",
+                        Some(Icon::default().path("icons/codex.svg")),
+                    )
+                    .accessibility_label("Codex Settings")
+                    .tooltip("Codex Settings")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.codex_settings(&OpenCodexSettings, window, cx)
+                    })),
                 ),
             )
             .into_any_element()
@@ -938,26 +1206,25 @@ impl Shell {
                 ))
             })
             .child(
-                Button::new(SharedString::from(format!("workspace-{id}")))
-                    .ghost()
-                    .w_full()
-                    .h(px(38.))
-                    .justify_start()
-                    .icon(if workspace.roots.len() > 1 {
+                theme::nav_button(
+                    SharedString::from(format!("workspace-{id}")),
+                    workspace.display_name(),
+                    Some(Icon::new(if workspace.roots.len() > 1 {
                         IconName::Layers
                     } else {
                         IconName::Folder
-                    })
-                    .label(workspace.display_name())
-                    .when(selected, |button| {
-                        button.bg(rgb(BORDER)).text_color(rgb(TEXT))
-                    })
-                    .when(archived, |button| button.text_color(rgb(MUTED)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.send(Command::Select(id));
-                        this.search
-                            .update(cx, |input, cx| input.set_value("", window, cx));
                     })),
+                )
+                .h(px(38.))
+                .when(selected, |button| {
+                    button.bg(rgb(BORDER)).text_color(rgb(TEXT))
+                })
+                .when(archived, |button| button.text_color(rgb(MUTED)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.send(Command::Select(id));
+                    this.search
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                })),
             )
             .into_any_element()
     }
@@ -1081,65 +1348,313 @@ impl Shell {
         } else {
             "Connecting"
         };
+        let access = self.composer_controls.read(cx).access_label().to_owned();
+        let mut attachments = div().flex().flex_wrap().gap_2();
+        for (index, path) in self.attachments.iter().enumerate() {
+            let label = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            attachments = attachments.child(
+                Button::new(("attachment", index))
+                    .small()
+                    .label(label)
+                    .icon(IconName::X)
+                    .tooltip(format!("Remove {}", path.display()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if index < this.attachments.len() {
+                            this.attachments.remove(index);
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
         div()
-            .mt_8()
+            .w_full()
+            .max_w(px(880.))
+            .rounded(px(20.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
             .p_3()
-            .rounded_md()
-            .bg(rgb(BORDER))
             .flex()
             .flex_col()
             .gap_2()
+            .when(!self.attachments.is_empty(), |view| view.child(attachments))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().font_weight(FontWeight::MEDIUM).child("New task"))
-                    .child(theme::caption(status)),
-            )
-            .child(Input::new(&self.composer).small())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(theme::caption("Work locally · Enter to send"))
+                    .min_h(px(88.))
+                    .max_h(px(180.))
+                    .overflow_y_scrollbar()
                     .child(
-                        Button::new("send-task")
-                            .primary()
-                            .small()
-                            .label(if self.turn_active {
-                                "Working…"
-                            } else {
-                                "Send"
-                            })
-                            .disabled(self.turn_active || !self.account.connected)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.start_task(window, cx)),
+                        Textarea::new(&self.composer)
+                            .appearance(false)
+                            .bordered(false),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("attach-context")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .accessibility_label("Attach files or images")
+                                    .tooltip("Attach files or images")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach_context(window, cx)
+                                    })),
+                            )
+                            .child(theme::caption(access))
+                            .child(
+                                Button::new("session-status")
+                                    .ghost()
+                                    .small()
+                                    .label(status)
+                                    .tooltip("Session and account usage")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.session_status(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(self.composer_controls.clone())
+                            .child(
+                                Button::new("send-task")
+                                    .primary()
+                                    .small()
+                                    .icon(if self.turn_active {
+                                        IconName::Square
+                                    } else {
+                                        IconName::ArrowUp
+                                    })
+                                    .rounded_full()
+                                    .size(px(32.))
+                                    .accessibility_label(if self.turn_active {
+                                        "Stop Codex"
+                                    } else {
+                                        "Send prompt"
+                                    })
+                                    .tooltip(if self.turn_active {
+                                        "Stop Codex"
+                                    } else {
+                                        "Send prompt"
+                                    })
+                                    .disabled(!self.account.connected)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(workspace) = this.active_turn_workspace {
+                                            let _ = this
+                                                .account_sender
+                                                .send(app_server::Request::Interrupt { workspace });
+                                        } else {
+                                            this.start_task(window, cx);
+                                        }
+                                    })),
                             ),
                     ),
             )
-            .when(!self.activity.is_empty(), |view| {
-                let mut activity = div()
-                    .mt_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(rgb(MUTED))
-                    .flex()
-                    .flex_col()
-                    .gap_1();
-                for entry in self.activity.iter().rev().take(8).rev() {
-                    activity = activity.child(
+            .into_any_element()
+    }
+
+    fn conversation(&self, cx: &Context<Self>) -> AnyElement {
+        let current_workspace = self.state.active_workspace;
+        let has_messages = self.activity.iter().any(|entry| {
+            Some(entry.workspace) == current_workspace
+                && (self.state.preferences.show_tool_activity
+                    || entry.user
+                    || matches!(entry.kind.as_str(), "agentMessage" | "reasoning"))
+        });
+        if !has_messages {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().font_weight(FontWeight::MEDIUM).child("Start a task"))
+                .child(theme::caption(
+                    "Describe the change you want in this workspace. Codex will show its work here as it runs.",
+                ))
+                .into_any_element();
+        }
+
+        let mut messages = div().flex().flex_col().gap_4();
+        for entry in self
+            .activity
+            .iter()
+            .filter(|entry| Some(entry.workspace) == current_workspace)
+            .filter(|entry| {
+                self.state.preferences.show_tool_activity
+                    || entry.user
+                    || matches!(entry.kind.as_str(), "agentMessage" | "reasoning")
+            })
+        {
+            if entry.user {
+                messages = messages.child(
+                    div().w_full().flex().justify_end().child(
                         div()
+                            .max_w(px(680.))
+                            .rounded(px(16.))
+                            .bg(rgb(SURFACE))
+                            .p_3()
+                            .text_color(rgb(TEXT))
+                            .child(entry.text.clone()),
+                    ),
+                );
+                continue;
+            }
+
+            let is_tool = !matches!(entry.kind.as_str(), "agentMessage" | "reasoning");
+            if is_tool {
+                let id = entry.id.clone().unwrap_or_default();
+                let expanded = self
+                    .expanded_activity
+                    .contains(&(entry.workspace, id.clone()));
+                let summary = entry
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or("Codex activity")
+                    .to_owned();
+                let kind = entry.kind.clone();
+                let full_text = entry.text.clone();
+                let workspace = entry.workspace;
+                let mut row =
+                    div()
+                        .w_full()
+                        .max_w(px(820.))
+                        .rounded(px(10.))
+                        .bg(rgb(BACKGROUND))
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::new(IconName::Ellipsis).text_color(rgb(MUTED)))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("{} · {}", activity_label(&kind), summary)),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "toggle-activity-{workspace}-{id}"
+                                    )))
+                                    .ghost()
+                                    .small()
+                                    .icon(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .accessibility_label(if expanded {
+                                        "Collapse activity output"
+                                    } else {
+                                        "Expand activity output"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_activity(workspace, id.clone(), cx)
+                                    })),
+                                ),
+                        );
+                if expanded {
+                    row = row.child(
+                        div()
+                            .max_h(px(360.))
+                            .overflow_y_scrollbar()
+                            .rounded(px(8.))
+                            .bg(rgb(BACKGROUND))
+                            .p_3()
                             .text_size(px(12.))
                             .text_color(rgb(MUTED))
-                            .line_clamp(2)
-                            .child(entry.clone()),
+                            .child(full_text),
                     );
                 }
-                view.child(activity)
-            })
-            .into_any_element()
+                messages = messages.child(row);
+            } else {
+                messages = messages.child(
+                    div()
+                        .w_full()
+                        .max_w(px(820.))
+                        .text_color(rgb(TEXT))
+                        .line_height(relative(1.5))
+                        .child(TextView::markdown(
+                            SharedString::from(format!(
+                                "message-{}-{}",
+                                entry.workspace,
+                                entry.id.as_deref().unwrap_or("local")
+                            )),
+                            entry.text.clone(),
+                        )),
+                );
+            }
+        }
+        if let Some(approval) = self
+            .pending_approvals
+            .iter()
+            .find(|approval| Some(approval.workspace) == current_workspace)
+        {
+            let description = approval.description.clone();
+            messages = messages.child(
+                div()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .bg(rgb(SURFACE))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Codex needs approval"),
+                    )
+                    .child(theme::caption(description))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("approve-task")
+                                    .primary()
+                                    .small()
+                                    .label("Allow")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.resolve_approval(true, cx)
+                                    })),
+                            )
+                            .child(Button::new("deny-task").small().label("Deny").on_click(
+                                cx.listener(|this, _, _, cx| this.resolve_approval(false, cx)),
+                            )),
+                    ),
+            );
+        }
+        if let Some(view) =
+            current_workspace.and_then(|workspace| self.pending_questions.get(&workspace))
+        {
+            messages = messages.child(view.clone());
+        }
+        messages.into_any_element()
     }
 
     fn content(&self, cx: &Context<Self>) -> AnyElement {
@@ -1183,13 +1698,54 @@ impl Shell {
                 "No folders in this workspace. Add a folder to continue.",
             )));
         }
+        let mut folder_section = div()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        Button::new("toggle-folders")
+                            .ghost()
+                            .small()
+                            .icon(if self.folders_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .label(format!("Folders  {}", workspace.roots.len()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.folders_collapsed = !this.folders_collapsed;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("add-folder")
+                            .ghost()
+                            .small()
+                            .label("Add folder")
+                            .icon(IconName::Plus)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_folder(&AddFolder, window, cx)
+                            })),
+                    ),
+            );
+        if !self.folders_collapsed {
+            folder_section = folder_section.child(folders);
+        }
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(60.))
+                    .h(px(44.))
                     .px_6()
                     .border_b_1()
                     .border_color(rgb(BORDER))
@@ -1203,6 +1759,18 @@ impl Shell {
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(workspace.display_name()),
+                    )
+                    .child(
+                        Button::new("workspace-folders-toggle")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Folder)
+                            .tooltip("Workspace folders")
+                            .accessibility_label("Workspace folders")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.folders_collapsed = !this.folders_collapsed;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("workspace-menu")
@@ -1226,61 +1794,29 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_6()
+                    .track_scroll(&self.conversation_scroll)
+                    .p_5()
+                    .when(!self.folders_collapsed, |view| view.child(folder_section))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .pb_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(div().font_weight(FontWeight::MEDIUM).child("Folders"))
-                                    .child(theme::caption(workspace.roots.len().to_string())),
-                            )
-                            .child(
-                                Button::new("add-folder")
-                                    .ghost()
-                                    .small()
-                                    .label("Add folder")
-                                    .icon(IconName::Plus)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_folder(&AddFolder, window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(folders)
-                    .child(
-                        div()
-                            .mt_10()
+                            .mx_auto()
+                            .w_full()
+                            .max_w(px(880.))
+                            .mt_5()
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Codex"))
-                            .child(
-                                div()
-                                    .text_color(rgb(if self.account.connected {
-                                        ACCENT
-                                    } else {
-                                        MUTED
-                                    }))
-                                    .child(if self.account.connected {
-                                        "Connected through your local Codex harness."
-                                    } else {
-                                        "Connecting to your local Codex harness…"
-                                    }),
-                            )
-                            .child(theme::caption(if self.account.connected {
-                                "This workspace is ready for a Codex task."
-                            } else {
-                                "Account status will appear when the local App Server responds."
-                            })),
+                            .child(self.conversation(cx)),
                     ),
             )
-            .child(div().px_6().pb_3().child(self.task_composer(cx)))
+            .child(
+                div()
+                    .px_5()
+                    .pb_3()
+                    .flex()
+                    .justify_center()
+                    .child(self.task_composer(cx)),
+            )
             .child(
                 div()
                     .h(px(34.))
@@ -1321,6 +1857,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::clear_search))
             .on_action(cx.listener(Self::preferences))
+            .on_action(cx.listener(Self::codex_settings))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::check_updates))
             .on_action(cx.listener(Self::release_notes))
@@ -1334,6 +1871,7 @@ impl Render for Shell {
             .text_size(px(14.))
             .flex()
             .flex_col()
+            .child(self.app_header(cx))
             .when_some(self.warning.clone(), |view, warning| {
                 view.child(
                     div()
@@ -1364,7 +1902,6 @@ impl Render for Shell {
                         ),
                 )
             })
-            .child(self.app_header(cx))
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable(if self.loaded {

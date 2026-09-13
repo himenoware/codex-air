@@ -80,3 +80,24 @@ automated regression suite.
   milestone. No agent backend is simulated. The current build does establish a
   real local App Server connection for managed-account discovery and supported
   ChatGPT browser sign-in.
+
+## 0.3.0 verification — 2026-09-13
+
+The earlier milestone limitations above are historical. In 0.3.0, a prompt sent
+through the native composer returned `AIR_UI_OK` from the real App Server. The
+saved conversation, including the user prompt and assistant reply, was visually
+verified after restart. A separate native close/relaunch check confirmed the
+window restored maximized (`IsZoomed = true`). One measured release launch reached
+its first-frame callback in 486.7 ms; this is a callback timing, not a presentation
+timestamp or a multi-sample benchmark.
+
+The Settings button's SVG, left-aligned sidebar, rounded composer, restored chat,
+and native Codex Settings dialog were visually inspected. Live `config/read`,
+`model/list`, `account/rateLimits/read`, `mcpServerStatus/list`, `hooks/list`, and
+`plugin/list` requests succeeded against the installed official VS Code harness.
+Release compilation, Clippy with warnings denied, and whitespace checks passed.
+
+Approvals, question responses, attachments, and interruption are implemented from
+the installed schema but were not all exercised through native UI in this pass.
+Mixed-DPI first-paint behavior, long-session performance, queue/steer, multiple
+conversations per workspace, and richer diff review remain unverified or pending.

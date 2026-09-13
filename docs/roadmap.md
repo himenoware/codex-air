@@ -11,7 +11,10 @@ The roadmap follows the smallest useful native workflow first, then adds a real 
 - `CODEX_AIR_DATA_DIR` override
 - Release startup verification
 
-There is no agent simulation or cloud backend in this milestone. The shell starts the official local App Server to discover its managed account state and request supported ChatGPT sign-in when needed; threads and agent work are not implemented yet. The controller, atomic local-state writes, and Windows single-instance boundary are part of the native shell.
+There is no simulated agent or cloud backend. The native shell starts the official
+local App Server and uses its managed account. The initial thread composer shipped
+in 0.1.0, but protocol values and streaming presentation required correction.
+Version 0.3.0 addresses those defects and separates Codex Settings from app preferences.
 
 ## Next milestones
 
@@ -21,3 +24,22 @@ There is no agent simulation or cloud backend in this milestone. The shell start
 4. Interaction and release polish for daily Windows use.
 
 The developer-platform Agents API remains a separate, future credential and billing path. It will not be treated as interchangeable with a ChatGPT subscription connection.
+
+## Requests that still require end-to-end verification
+
+These are tracked requirements, not completed features:
+
+- Multiple conversations per workspace, thread history loading, creation, and switching.
+- File and image attachments with previews and removal.
+- Composer model/effort selection, permission profile, context usage, and rate-limit status.
+- Stop, queue, and steer during an active turn.
+- Complete command/file approval and user-input flows; no unanswered server requests.
+- Markdown/code rendering, selectable transcript, copy actions, and natural diff review.
+- Settings parity with the supplied General, Configuration, Personalization, Usage,
+  MCP, Hooks, Plugins, and Account references wherever the official runtime supports it.
+- Memory controls and model-specific reasoning options must use real capabilities.
+- Archive manager recovery, keyboard navigation, and File recents on the real Windows build.
+- Startup at saved size/mode without a resize flash on multiple DPI settings.
+- Real update discovery, a downloadable Windows release, and accurate historical release notes.
+
+Never replace these requirements with static labels and report them as delivered.

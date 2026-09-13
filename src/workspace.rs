@@ -21,6 +21,8 @@ pub struct AppState {
     pub window: Option<WindowPlacement>,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    #[serde(default)]
+    pub preferences: Preferences,
 }
 
 impl Default for AppState {
@@ -31,6 +33,23 @@ impl Default for AppState {
             active_workspace: None,
             window: None,
             sidebar_width: default_sidebar_width(),
+            preferences: Preferences::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preferences {
+    pub enter_sends: bool,
+    pub show_tool_activity: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            enter_sends: true,
+            show_tool_activity: true,
         }
     }
 }
@@ -210,11 +229,17 @@ impl AppState {
             }
         }
 
-        if self
-            .active_workspace
-            .is_some_and(|workspace_id| !workspace_ids.contains(&workspace_id))
-        {
-            self.active_workspace = None;
+        if self.active_workspace.is_some_and(|workspace_id| {
+            !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id && !workspace.archived)
+        }) {
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .find(|workspace| !workspace.archived)
+                .map(|workspace| workspace.id);
             changed = true;
         }
 
@@ -252,10 +277,11 @@ impl AppState {
         let canonical_path = canonical_directory(&path)?;
         let identity = directory_identity(&canonical_path)?;
 
-        if let Some(workspace) = self.workspaces.iter().find(|workspace| {
+        if let Some(workspace) = self.workspaces.iter_mut().find(|workspace| {
             workspace.roots.len() == 1 && root_matches(&workspace.roots[0], &identity)
         }) {
             let id = workspace.id;
+            workspace.archived = false;
             self.select_workspace(id);
             return Ok(id);
         }
@@ -372,7 +398,11 @@ impl AppState {
         let was_active = self.active_workspace == Some(workspace_id);
         self.workspaces.remove(index);
         if was_active {
-            self.active_workspace = self.workspaces.first().map(|workspace| workspace.id);
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .find(|workspace| !workspace.archived)
+                .map(|workspace| workspace.id);
         }
     }
 
@@ -413,13 +443,26 @@ impl AppState {
         {
             workspace.thread_id = Some(thread_id);
         }
+        self.record_activity(workspace_id);
+    }
+
+    /// Recency records work, never navigation, pinning, or renaming.
+    pub fn record_activity(&mut self, workspace_id: Uuid) {
+        if let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        {
+            let workspace = self.workspaces.remove(index);
+            self.workspaces.insert(0, workspace);
+        }
     }
 
     pub fn select_workspace(&mut self, workspace_id: Uuid) {
         if self
             .workspaces
             .iter()
-            .any(|workspace| workspace.id == workspace_id)
+            .any(|workspace| workspace.id == workspace_id && !workspace.archived)
         {
             self.active_workspace = Some(workspace_id);
         }

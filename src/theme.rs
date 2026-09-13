@@ -1,14 +1,19 @@
 use gpui_kit::{
-    component::{Theme, ThemeMode, theme::ThemeTokens},
+    component::{
+        Icon, Theme, ThemeMode,
+        button::{Button, ButtonVariants},
+        theme::ThemeTokens,
+    },
+    prelude::FluentBuilder,
     *,
 };
 
-pub const BACKGROUND: u32 = 0x1e1e2e;
-pub const SIDEBAR: u32 = 0x181825;
-pub const SURFACE: u32 = 0x242436;
-pub const BORDER: u32 = 0x313244;
-pub const TEXT: u32 = 0xcdd6f4;
-pub const MUTED: u32 = 0xa6adc8;
+pub const BACKGROUND: u32 = 0x202127;
+pub const SIDEBAR: u32 = 0x191a20;
+pub const SURFACE: u32 = 0x2b2d35;
+pub const BORDER: u32 = 0x383a44;
+pub const TEXT: u32 = 0xe5e5eb;
+pub const MUTED: u32 = 0xa5a7b5;
 pub const ACCENT: u32 = 0x89b4fa;
 pub const ERROR: u32 = 0xf38ba8;
 
@@ -17,8 +22,8 @@ pub fn init(cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.font_family = "Segoe UI".into();
     theme.font_size = px(14.);
-    theme.radius = px(5.);
-    theme.radius_lg = px(8.);
+    theme.radius = px(8.);
+    theme.radius_lg = px(16.);
     theme.background = rgb(BACKGROUND).into();
     theme.foreground = rgb(TEXT).into();
     theme.border = rgb(BORDER).into();
@@ -26,10 +31,10 @@ pub fn init(cx: &mut App) {
     theme.muted_foreground = rgb(MUTED).into();
     theme.accent = rgb(BORDER).into();
     theme.accent_foreground = rgb(TEXT).into();
-    theme.primary = rgb(ACCENT).into();
+    theme.primary = rgb(TEXT).into();
     theme.primary_foreground = rgb(SIDEBAR).into();
-    theme.primary_hover = rgb(0xb4d0fc).into();
-    theme.primary_active = rgb(0x74a4ed).into();
+    theme.primary_hover = rgb(0xffffff).into();
+    theme.primary_active = rgb(0xcdced8).into();
     theme.secondary = rgb(SURFACE).into();
     theme.secondary_foreground = rgb(TEXT).into();
     theme.input = rgb(SIDEBAR).into();
@@ -55,4 +60,26 @@ pub fn caption(text: impl Into<SharedString>) -> Div {
         .text_size(px(12.))
         .text_color(rgb(MUTED))
         .child(text.into())
+}
+
+pub fn nav_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    icon: Option<Icon>,
+) -> Button {
+    let label = label.into();
+    Button::new(id)
+        .ghost()
+        .w_full()
+        .h(px(36.))
+        .accessibility_label(label.clone())
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .when_some(icon, |row, icon| row.child(icon.size(px(16.))))
+                .child(div().flex_1().min_w_0().truncate().child(label)),
+        )
 }

@@ -4,7 +4,9 @@ Codex Air is a focused native Windows workspace for Codex. It provides persisten
 
 ## Status
 
-The current milestone provides the native shell, the first-class project boundary, an application menu, and account discovery through the local Codex App Server. Workspace roots can be added and removed, a default working root is retained, and workspace identity is stored locally. Threads, turns, streamed agent activity, approvals, and diff review are the next product work.
+The Windows preview provides saved multi-root workspaces and real Codex conversations. The chat includes a multiline composer, model and effort selection, image/file context, streamed Markdown, expandable tool output, approvals, questions, stop control, and session recovery. Codex Settings reads the installed harness's configuration, account usage, MCP servers, hooks, and plugins; app preferences are separate.
+
+There is currently one active conversation per workspace and one running turn across the application. Multiple-session navigation, queue/steer, richer diff review, and sustained-session performance remain on the roadmap.
 
 ## Build on Windows
 
@@ -24,7 +26,7 @@ Run the repository scripts:
 ./scripts/build.ps1
 ```
 
-The release executable is `target/release/codex-air.exe`. Portable distribution packaging is planned separately.
+The release executable is `target/release/codex-air.exe`. Its UI assets are embedded; the official Codex harness must also be installed.
 
 Keyboard shortcuts include Ctrl+O to open a folder, Ctrl+Shift+O to add a folder, Ctrl+P to focus workspace search, Ctrl+, for Preferences, and Escape to clear search and return focus to the shell.
 
@@ -34,7 +36,7 @@ State is written to `%LOCALAPPDATA%\Codex Air\state.json`. Set `CODEX_AIR_DATA_D
 
 ## Codex connection
 
-Codex Air launches the local `codex app-server`, performs the documented JSONL initialization sequence, and reads the managed account state. If the local Codex harness is already signed in, the app discovers that session on launch. Preferences exposes a supported ChatGPT browser sign-in only when the harness has no account. Codex Air never reads, copies, or stores access tokens.
+Codex Air launches the newest available official local harness from the Codex desktop installation, PATH, or the Codex VS Code extension. `CODEX_AIR_CODEX_PATH` explicitly overrides discovery. The app performs the documented JSONL initialization sequence and reads the managed account state. If the local harness is already signed in, Codex Air discovers that session on launch. Codex Settings → Account exposes supported ChatGPT browser sign-in when needed. Codex Air never reads, copies, or stores access tokens.
 
 This is separate from the developer-platform Agents API, which has its own API credentials and billing path. The project follows official documentation and does not reverse engineer private authentication endpoints.
 
