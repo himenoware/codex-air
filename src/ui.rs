@@ -34,6 +34,8 @@ actions!(
         Preferences,
         About,
         CheckUpdates,
+        ReleaseNotes,
+        Archives,
         Exit
     ]
 );
@@ -377,13 +379,37 @@ impl Shell {
                 }
             });
             dialog
-                .title("Preferences")
+                .title("Codex Settings")
                 .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_2()
-                        .child(div().font_weight(FontWeight::MEDIUM).child("Codex account"))
+                        .gap_4()
+                        .child(div().font_weight(FontWeight::MEDIUM).child("General"))
+                        .child(div().flex().flex_col().gap_1()
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Agent environment"))
+                            .child(theme::caption("Windows native"))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Language"))
+                            .child(theme::caption("Auto detect"))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Review delivery"))
+                            .child(theme::caption("Inline"))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Composer"))
+                            .child(theme::caption("Enter sends a prompt · Follow-ups queue while Codex works")))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Configuration"))
+                        .child(div().flex().flex_col().gap_1()
+                            .child(div().font_weight(FontWeight::MEDIUM).child("config.toml"))
+                            .child(theme::caption("Codex reads your local configuration and workspace instructions when it starts a task."))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Reasoning effort"))
+                            .child(theme::caption("Configured by the model selected by your local Codex harness.")))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Personalization"))
+                        .child(theme::caption("Repository instructions and local Codex preferences apply to every task in this workspace."))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Usage & billing"))
+                        .when_some(account.plan.clone(), |view, plan| {
+                            view.child(theme::caption(format!("ChatGPT {plan}")))
+                        })
+                        .child(div().font_weight(FontWeight::MEDIUM).child("MCP servers · Hooks · Plugins"))
+                        .child(theme::caption("Managed by your local Codex installation."))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Account"))
                         .child(
                             div()
                                 .text_color(rgb(if connected { ACCENT } else { MUTED }))
@@ -465,6 +491,55 @@ impl Shell {
         });
     }
 
+    fn release_notes(&mut self, _: &ReleaseNotes, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog
+                .title("Release notes")
+                .child(div().flex().flex_col().gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Codex Air 0.2.0"))
+                    .child(theme::caption("Native header, workspace organization, local Codex account connection, and the first App Server task composer."))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Codex Air 0.1.0"))
+                    .child(theme::caption("Initial Windows-native workspace shell.")))
+                .footer(dialog_footer("Close", false))
+        });
+    }
+
+    fn archives(&mut self, _: &Archives, window: &mut Window, cx: &mut Context<Self>) {
+        let archived: Vec<_> = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.archived)
+            .map(|workspace| (workspace.id, workspace.display_name()))
+            .collect();
+        let sender = self.sender.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let mut content = div().flex().flex_col().gap_2();
+            if archived.is_empty() {
+                content = content.child(theme::caption("No archived workspaces."));
+            } else {
+                for (id, name) in &archived {
+                    let sender = sender.clone();
+                    let id = *id;
+                    content = content.child(
+                        Button::new(SharedString::from(format!("restore-archive-{id}")))
+                            .ghost()
+                            .w_full()
+                            .justify_start()
+                            .label(format!("Restore  {name}"))
+                            .on_click(move |_, _, _| {
+                                let _ = sender.send(Command::ToggleArchive(id));
+                            }),
+                    );
+                }
+            }
+            dialog
+                .title("Archives")
+                .child(content)
+                .footer(dialog_footer("Close", false))
+        });
+    }
+
     fn app_header(&self, _: &Context<Self>) -> AnyElement {
         let workspace = self
             .state
@@ -495,6 +570,7 @@ impl Shell {
                             .tooltip("Codex Air")
                             .dropdown_menu(|menu, _, _| {
                                 menu.menu("About Codex Air", Box::new(About))
+                                    .menu("Release notes", Box::new(ReleaseNotes))
                                     .separator()
                                     .menu("Check for updates…", Box::new(CheckUpdates))
                             }),
@@ -513,6 +589,15 @@ impl Shell {
     }
 
     fn menubar(&self) -> AnyElement {
+        let recents: Vec<_> = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|workspace| !workspace.archived)
+            .take(8)
+            .map(|workspace| (workspace.id, workspace.display_name()))
+            .collect();
+        let recent_sender = self.sender.clone();
         div()
             .flex()
             .items_center()
@@ -522,12 +607,27 @@ impl Shell {
                     .ghost()
                     .small()
                     .label("File")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(PopupMenuItem::new("New task").disabled(true))
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut menu = menu
+                            .item(PopupMenuItem::new("New task").disabled(true))
                             .separator()
                             .menu("Open folder…", Box::new(OpenFolder))
                             .menu("Add folder to workspace…", Box::new(AddFolder))
-                            .separator()
+                            .separator();
+                        if !recents.is_empty() {
+                            menu = menu.item(PopupMenuItem::label("Recent workspaces"));
+                            for (id, name) in &recents {
+                                let sender = recent_sender.clone();
+                                let id = *id;
+                                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, _, _| {
+                                        let _ = sender.send(Command::Select(id));
+                                    },
+                                ));
+                            }
+                            menu = menu.separator();
+                        }
+                        menu.separator()
                             .menu("Preferences…", Box::new(Preferences))
                             .separator()
                             .menu("Exit", Box::new(Exit))
@@ -554,6 +654,7 @@ impl Shell {
                     .label("Help")
                     .dropdown_menu(|menu, _, _| {
                         menu.menu("Check for updates…", Box::new(CheckUpdates))
+                            .menu("Release notes", Box::new(ReleaseNotes))
                             .separator()
                             .menu("About Codex Air", Box::new(About))
                     }),
@@ -689,12 +790,6 @@ impl Shell {
                 list = list.child(self.workspace_sidebar_row(workspace, cx));
             }
         }
-        if filtered.iter().any(|workspace| workspace.archived) {
-            list = list.child(theme::caption("ARCHIVED"));
-            for workspace in filtered.iter().filter(|workspace| workspace.archived) {
-                list = list.child(self.workspace_sidebar_row(workspace, cx));
-            }
-        }
         if filtered.is_empty() {
             list = list.child(
                 div()
@@ -716,6 +811,10 @@ impl Shell {
             .bg(rgb(SIDEBAR))
             .flex()
             .flex_col()
+            .context_menu(|menu, _, _| {
+                menu.menu("Open folder…", Box::new(OpenFolder))
+                    .menu("Add folder to workspace…", Box::new(AddFolder))
+            })
             .child(
                 div().px_3().pt_3().pb_3().child(
                     Input::new(&self.search)
@@ -744,6 +843,27 @@ impl Shell {
                     ),
             )
             .child(list)
+            .when(
+                self.state
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.archived),
+                |view| {
+                    view.child(
+                        div().px_2().pb_1().child(
+                            Button::new("archives")
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .icon(IconName::Archive)
+                                .label("Archives")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.archives(&Archives, window, cx)
+                                })),
+                        ),
+                    )
+                },
+            )
             .child(
                 div().border_t_1().border_color(rgb(BORDER)).p_2().child(
                     Button::new("sidebar-account")
@@ -1203,6 +1323,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::preferences))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::check_updates))
+            .on_action(cx.listener(Self::release_notes))
+            .on_action(cx.listener(Self::archives))
             .on_action(cx.listener(Self::exit))
             .relative()
             .size_full()
